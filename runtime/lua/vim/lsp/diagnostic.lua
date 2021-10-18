@@ -203,8 +203,10 @@ local bufnr_and_client_cacher_mt = {
 -- Diagnostic Saving & Caching {{{
 local _diagnostic_cleanup = setmetatable({}, bufnr_and_client_cacher_mt)
 local diagnostic_cache = setmetatable({}, bufnr_and_client_cacher_mt)
+local diagnostic_cache_extmarks = setmetatable({}, bufnr_and_client_cacher_mt)
 local diagnostic_cache_lines = setmetatable({}, bufnr_and_client_cacher_mt)
 local diagnostic_cache_counts = setmetatable({}, bufnr_and_client_cacher_mt)
+local diagnostic_attached_buffers = {}
 
 local _bufs_waiting_to_update = setmetatable({}, bufnr_and_client_cacher_mt)
 
@@ -826,6 +828,7 @@ function M.clear(bufnr, client_id, diagnostic_ns, sign_ns)
 
   diagnostic_ns = diagnostic_ns or M._get_diagnostic_namespace(client_id)
   sign_ns = sign_ns or M._get_sign_namespace(client_id)
+  diagnostic_cache_extmarks[bufnr][client_id] = {}
 
   assert(bufnr, "bufnr is required")
   assert(diagnostic_ns, "Need diagnostic_ns, got nil")
@@ -1005,15 +1008,16 @@ end
 ---         - Update diagnostics in InsertMode or wait until InsertLeave
 ---     - severity_sort:    (default=false)
 ---         - Sort diagnostics (and thus signs and virtual text)
-function M.on_publish_diagnostics(_, _, params, client_id, _, config)
-  local uri = params.uri
+function M.on_publish_diagnostics(_, result, ctx, config)
+  local client_id = ctx.client_id
+  local uri = result.uri
   local bufnr = vim.uri_to_bufnr(uri)
 
   if not bufnr then
     return
   end
 
-  local diagnostics = params.diagnostics
+  local diagnostics = result.diagnostics
 
   if config and if_nil(config.severity_sort, false) then
     table.sort(diagnostics, function(a, b) return a.severity > b.severity end)
@@ -1036,6 +1040,54 @@ function M.on_publish_diagnostics(_, _, params, client_id, _, config)
   end
 
   M.display(diagnostics, bufnr, client_id, config)
+end
+
+-- restores the extmarks set by M.display
+--- @param last number last line that was changed
+-- @private
+local function restore_extmarks(bufnr, last)
+  for client_id, extmarks in pairs(diagnostic_cache_extmarks[bufnr]) do
+    local ns = M._get_diagnostic_namespace(client_id)
+    local extmarks_current = api.nvim_buf_get_extmarks(bufnr, ns, 0, -1, {details = true})
+    local found = {}
+    for _, extmark in ipairs(extmarks_current) do
+      -- nvim_buf_set_lines will move any extmark to the line after the last
+      -- nvim_buf_set_text will move any extmark to the last line
+      if extmark[2] ~= last + 1 then
+        found[extmark[1]] = true
+      end
+    end
+    for _, extmark in ipairs(extmarks) do
+      if not found[extmark[1]] then
+        local opts = extmark[4]
+        opts.id = extmark[1]
+        -- HACK: end_row should be end_line
+        if opts.end_row then
+          opts.end_line = opts.end_row
+          opts.end_row = nil
+        end
+        pcall(api.nvim_buf_set_extmark, bufnr, ns, extmark[2], extmark[3], opts)
+      end
+    end
+  end
+end
+
+-- caches the extmarks set by M.display
+-- @private
+local function save_extmarks(bufnr, client_id)
+  bufnr = bufnr == 0 and api.nvim_get_current_buf() or bufnr
+  if not diagnostic_attached_buffers[bufnr] then
+    api.nvim_buf_attach(bufnr, false, {
+      on_lines = function(_, _, _, _, _, last)
+        restore_extmarks(bufnr, last -  1)
+      end,
+      on_detach = function()
+        diagnostic_cache_extmarks[bufnr] = nil
+      end})
+    diagnostic_attached_buffers[bufnr] = true
+  end
+  local ns = M._get_diagnostic_namespace(client_id)
+  diagnostic_cache_extmarks[bufnr][client_id] = api.nvim_buf_get_extmarks(bufnr, ns, 0, -1, {details = true})
 end
 
 --@private
@@ -1108,9 +1160,46 @@ function M.display(diagnostics, bufnr, client_id, config)
   if signs_opts then
     M.set_signs(diagnostics, bufnr, client_id, nil, signs_opts)
   end
+
+  -- cache extmarks
+  save_extmarks(bufnr, client_id)
 end
--- }}}
--- Diagnostic User Functions {{{
+
+--- Redraw diagnostics for the given buffer and client
+---
+--- This calls the "textDocument/publishDiagnostics" handler manually using
+--- the cached diagnostics already received from the server. This can be useful
+--- for redrawing diagnostics after making changes in diagnostics
+--- configuration. |lsp-handler-configuration|
+---
+---@param bufnr (optional, number): Buffer handle, defaults to current
+---@param client_id (optional, number): Redraw diagnostics for the given
+---       client. The default is to redraw diagnostics for all attached
+---       clients.
+function M.redraw(bufnr, client_id)
+  bufnr = get_bufnr(bufnr)
+  if not client_id then
+    return vim.lsp.for_each_buffer_client(bufnr, function(client)
+      M.redraw(bufnr, client.id)
+    end)
+  end
+
+  -- We need to invoke the publishDiagnostics handler directly instead of just
+  -- calling M.display so that we can preserve any custom configuration options
+  -- the user may have set with vim.lsp.with.
+  vim.lsp.handlers["textDocument/publishDiagnostics"](
+    nil,
+    {
+      uri = vim.uri_from_bufnr(bufnr),
+      diagnostics = M.get(bufnr, client_id),
+    },
+    {
+      method = "textDocument/publishDiagnostics",
+      client_id = client_id,
+      bufnr = bufnr,
+    }
+    )
+  end
 
 --- Open a floating window with the diagnostics from {line_nr}
 ---
